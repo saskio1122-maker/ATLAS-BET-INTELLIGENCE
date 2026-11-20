@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
+import requests
 
 st.set_page_config(
     page_title="ATLAS BET INTELLIGENCE",
