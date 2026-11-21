@@ -1,249 +1,185 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
 import requests
 
-st.set_page_config(
-    page_title="ATLAS BET INTELLIGENCE",
-    page_icon="📊",
-    layout="wide"
-)
+st.set_page_config(page_title='ATLAS BET INTELLIGENCE', page_icon='📊', layout='wide')
+st.title('ATLAS BET INTELLIGENCE')
+st.caption('ATLAS CORE v2 | REAL ODDS • PREMATCH • VALUE • ARBITRAGE')
 
-st.title("ATLAS BET INTELLIGENCE")
-st.caption("ATLAS CORE v2 | PREMATCH • LIVE • VALUE • ARBITRAGE")
-st.warning("DEMO MODE: Example data is fictional, not real betting advice.")
-
-if "drafts" not in st.session_state:
+if 'drafts' not in st.session_state:
     st.session_state.drafts = []
 
+API_BASE = 'https://api.the-odds-api.com/v4'
+try:
+    API_KEY = st.secrets.get('ODDS_API_KEY', '')
+except Exception:
+    API_KEY = ''
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_sports(key):
+    response = requests.get(f'{API_BASE}/sports', params={'apiKey': key}, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_odds(key, sport, regions, markets):
+    response = requests.get(f'{API_BASE}/sports/{sport}/odds', params={
+        'apiKey': key, 'regions': regions, 'markets': markets,
+        'oddsFormat': 'decimal', 'dateFormat': 'iso'
+    }, timeout=30)
+    response.raise_for_status()
+    return response.json(), response.headers.get('x-requests-remaining', '?')
+
+st.sidebar.header('ATLAS Controls')
+if not API_KEY:
+    st.error('ODDS_API_KEY is missing in Streamlit Secrets. Add it in App settings → Secrets.')
+    st.stop()
+
+regions = st.sidebar.selectbox('Bookmaker region', ['eu', 'uk', 'us', 'au'], index=0)
+markets = 'h2h'
+try:
+    sports_data = [s for s in get_sports(API_KEY) if s.get('active') and not s.get('has_outrights')]
+except (requests.RequestException, ValueError) as exc:
+    st.error(f'Cannot load sports from The Odds API: {exc}')
+    st.stop()
+
+sport_options = {f"{s['title']} ({s['key']})": s['key'] for s in sports_data}
+if not sport_options:
+    st.warning('No active sports returned by the API.')
+    st.stop()
+selected_label = st.sidebar.selectbox('Sport / league', list(sport_options))
+selected_sport = sport_options[selected_label]
+
+if st.sidebar.button('Refresh odds'):
+    get_odds.clear()
+
+try:
+    events, remaining = get_odds(API_KEY, selected_sport, regions, markets)
+except (requests.RequestException, ValueError) as exc:
+    st.error(f'Cannot load odds: {exc}')
+    st.stop()
+
+st.sidebar.caption(f'API requests remaining (reported): {remaining}')
+st.sidebar.caption('Odds refresh cache: 120 seconds. Each fresh API call may consume quota.')
 now = datetime.now(timezone.utc)
+rows = []
+for event in events:
+    event_id = event.get('id', '')
+    home = event.get('home_team', '')
+    away = event.get('away_team', '')
+    event_name = f'{home} vs {away}'
+    for bookmaker in event.get('bookmakers', []):
+        for market in bookmaker.get('markets', []):
+            if market.get('key') != 'h2h':
+                continue
+            updated = market.get('last_update') or bookmaker.get('last_update')
+            for outcome in market.get('outcomes', []):
+                try:
+                    price = float(outcome.get('price'))
+                except (TypeError, ValueError):
+                    continue
+                if price <= 1:
+                    continue
+                rows.append({
+                    'event_id': event_id, 'sport': selected_label,
+                    'event': event_name, 'commence_time': event.get('commence_time'),
+                    'bookmaker': bookmaker.get('title', bookmaker.get('key', '')),
+                    'selection': outcome.get('name', ''), 'odds': price,
+                    'updated_at': updated
+                })
 
-demo = pd.DataFrame([
-    ["Football", "Team A vs Team B", "PREMATCH", "Team A",
-     2.10, 0.52, 2.02, 1.90, now.isoformat()],
-    ["Tennis", "Player A vs Player B", "LIVE", "Player A",
-     1.85, 0.58, 1.80, 2.10, now.isoformat()],
-    ["Basketball", "Team C vs Team D", "LIVE", "Team C",
-     2.40, 0.39, 2.30, 1.80, now.isoformat()]
-], columns=[
-    "sport", "event", "mode", "selection",
-    "odds", "probability", "arb_odds_a",
-    "arb_odds_b", "updated_at"
-])
-
-st.sidebar.header("ATLAS Controls")
-source = st.sidebar.radio(
-    "Data source", ["Demo", "CSV upload"]
-)
-
-if source == "CSV upload":
-    upload = st.sidebar.file_uploader(
-        "Upload odds CSV", type=["csv"]
-    )
-    if upload is None:
-        st.info("Upload a CSV file to begin.")
-        st.stop()
-    try:
-        df = pd.read_csv(upload)
-    except Exception as error:
-        st.error(f"CSV error: {error}")
-        st.stop()
-else:
-    df = demo.copy()
-
-required = [
-    "sport", "event", "mode", "selection",
-    "odds", "probability", "arb_odds_a",
-    "arb_odds_b", "updated_at"
-]
-
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(f"Missing CSV columns: {', '.join(missing)}")
-    st.stop()
-
-for col in ["odds", "probability", "arb_odds_a", "arb_odds_b"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-df["updated_at"] = pd.to_datetime(
-    df["updated_at"], utc=True, errors="coerce"
-)
-
-df["mode"] = df["mode"].astype(str).str.upper().str.strip()
-
-valid = (
-    df["mode"].isin(["PREMATCH", "LIVE"])
-    & df["odds"].gt(1)
-    & df["probability"].between(0, 1)
-    & df["arb_odds_a"].gt(1)
-    & df["arb_odds_b"].gt(1)
-    & df["updated_at"].notna()
-)
-
-if (~valid).any():
-    st.warning(f"{int((~valid).sum())} invalid rows excluded.")
-
-df = df.loc[valid].copy()
-
+df = pd.DataFrame(rows)
+tab1, tab2, tab3, tab4 = st.tabs(['Scanner', 'Arbitrage', 'Risk & Drafts', 'Data'])
 if df.empty:
-    st.error("No valid events available.")
+    st.info('No bookmaker odds available for this sport and region right now. Try another sport or region.')
     st.stop()
 
-df["implied_probability"] = 1 / df["odds"]
-df["ev"] = df["odds"] * df["probability"] - 1
-df["arb_sum"] = (
-    1 / df["arb_odds_a"] + 1 / df["arb_odds_b"]
-)
-df["arb_margin"] = 1 - df["arb_sum"]
+df['updated_at'] = pd.to_datetime(df['updated_at'], utc=True, errors='coerce')
+df['commence_time'] = pd.to_datetime(df['commence_time'], utc=True, errors='coerce')
+df['age_seconds'] = (now - df['updated_at']).dt.total_seconds()
+df['implied_probability'] = 1 / df['odds']
 
-df["age_seconds"] = (
-    now - df["updated_at"]
-).dt.total_seconds()
+# Consensus is only a rough market-based proxy, NOT an independent predictive model.
+# Normalize each bookmaker's h2h implied probabilities to remove its overround.
+group_cols = ['event_id', 'bookmaker']
+df['market_total'] = df.groupby(group_cols)['implied_probability'].transform('sum')
+df['normalized_probability'] = df['implied_probability'] / df['market_total']
+consensus = df.groupby(['event_id', 'selection'])['normalized_probability'].median().rename('market_consensus')
+df = df.join(consensus, on=['event_id', 'selection'])
+df['indicative_ev'] = df['odds'] * df['market_consensus'] - 1
 
-live_limit = st.sidebar.slider(
-    "LIVE freshness limit (seconds)", 10, 300, 60
-)
-prematch_limit = st.sidebar.number_input(
-    "PREMATCH freshness limit (minutes)",
-    min_value=1, value=60
-)
-
-df["fresh"] = (
-    (df["age_seconds"] >= 0)
-    & (
-        ((df["mode"] == "LIVE")
-         & (df["age_seconds"] <= live_limit))
-        |
-        ((df["mode"] == "PREMATCH")
-         & (df["age_seconds"] <= prematch_limit * 60))
-    )
-)
-
-mode = st.sidebar.selectbox(
-    "Mode", ["ALL", "PREMATCH", "LIVE"]
-)
-
-sports = sorted(df["sport"].dropna().unique().tolist())
-chosen_sports = st.sidebar.multiselect(
-    "Sports", sports, default=sports
-)
-
-view = df[df["sport"].isin(chosen_sports)].copy()
-if mode != "ALL":
-    view = view[view["mode"] == mode]
-
-view["value_candidate"] = (
-    view["ev"].gt(0) & view["fresh"]
-)
-view["arbitrage_candidate"] = (
-    view["arb_sum"].lt(1) & view["fresh"]
-)
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Scanner", "Arbitrage", "Risk & Drafts", "Data"
-])
+fresh_limit = st.sidebar.slider('Maximum quote age (minutes)', 1, 60, 10)
+df['fresh'] = df['age_seconds'].between(0, fresh_limit * 60)
+view = df[df['fresh']].copy()
 
 with tab1:
-    st.subheader("Value Bet Scanner")
+    st.subheader('Real Odds Scanner')
     a, b, c = st.columns(3)
-    a.metric("Events", len(view))
-    b.metric("Value candidates",
-             int(view["value_candidate"].sum()))
-    c.metric("Fresh quotes", int(view["fresh"].sum()))
-
-    st.dataframe(
-        view[[
-            "sport", "event", "mode", "selection",
-            "odds", "probability", "ev",
-            "age_seconds", "fresh", "value_candidate"
-        ]],
-        use_container_width=True,
-        hide_index=True
-    )
-    st.caption(
-        "EV = odds × estimated probability − 1. "
-        "A positive EV depends on probability accuracy."
-    )
+    a.metric('Events', df['event_id'].nunique())
+    b.metric('Fresh quotes', len(view))
+    c.metric('Bookmakers', df['bookmaker'].nunique())
+    st.dataframe(view[['event', 'bookmaker', 'selection', 'odds', 'market_consensus', 'indicative_ev', 'updated_at']].sort_values('indicative_ev', ascending=False), hide_index=True, use_container_width=True)
+    st.caption('Indicative EV uses bookmaker-market consensus, not an independent probability forecast. It is NOT verified positive expected value.')
 
 with tab2:
-    st.subheader("Two-outcome Arbitrage")
-    arb = view[view["arbitrage_candidate"]]
-    st.dataframe(
-        arb[[
-            "event", "mode", "arb_odds_a",
-            "arb_odds_b", "arb_sum", "arb_margin"
-        ]],
-        use_container_width=True,
-        hide_index=True
-    )
-    if arb.empty:
-        st.info("No valid arbitrage candidates.")
-    st.caption(
-        "Assumes exactly two mutually exclusive, "
-        "exhaustive outcomes with identical settlement rules. "
-        "Fees, limits and execution risk are not included."
-    )
+    st.subheader('Cross-bookmaker arbitrage (h2h)')
+    arb_rows = []
+    for event_id, group in view.groupby('event_id'):
+        expected = {str(group.iloc[0]['event']).split(' vs ')[0], str(group.iloc[0]['event']).split(' vs ')[-1]}
+        selections = set(group['selection'])
+        # Exclude 3-way markets with Draw: only exhaustive two-outcome events.
+        if len(selections) != 2 or selections != expected:
+            continue
+        best = group.sort_values('odds', ascending=False).drop_duplicates('selection')
+        if len(best) != 2:
+            continue
+        inverse_sum = (1 / best['odds']).sum()
+        if inverse_sum < 1:
+            arb_rows.append({
+                'event': group.iloc[0]['event'],
+                'selection A': best.iloc[0]['selection'], 'bookmaker A': best.iloc[0]['bookmaker'], 'odds A': best.iloc[0]['odds'],
+                'selection B': best.iloc[1]['selection'], 'bookmaker B': best.iloc[1]['bookmaker'], 'odds B': best.iloc[1]['odds'],
+                'gross margin %': round((1 - inverse_sum) * 100, 2)
+            })
+    if arb_rows:
+        st.dataframe(pd.DataFrame(arb_rows).sort_values('gross margin %', ascending=False), hide_index=True, use_container_width=True)
+    else:
+        st.info('No two-outcome arbitrage found in fresh quotes.')
+    st.caption('Indicative gross margin only. Verify both prices, market rules, limits, fees, and settlement manually. Soccer 3-way h2h is excluded.')
 
 with tab3:
-    st.subheader("Risk Management")
-    bankroll = st.number_input(
-        "Bankroll", min_value=0.0, value=10000.0
-    )
-    risk = st.slider(
-        "Maximum stake (% of bankroll)", 1, 5, 1
-    )
+    st.subheader('Risk Management')
+    bankroll = st.number_input('Bankroll', min_value=0.0, value=10000.0)
+    risk = st.slider('Maximum stake (% of bankroll)', 1, 5, 1)
     maximum = bankroll * risk / 100
-    st.metric("Maximum stake", f"{maximum:,.2f}")
-
-    candidates = view[view["value_candidate"]]
-
-    st.subheader("Bet Draft")
-    if candidates.empty:
-        st.info("No fresh positive EV candidates.")
+    st.metric('Maximum stake', f'{maximum:,.2f}')
+    st.subheader('Local analysis drafts')
+    if view.empty:
+        st.info('No fresh quotes to add.')
     else:
-        labels = [
-            f"{i}: {row['event']} | {row['selection']}"
-            for i, row in candidates.iterrows()
-        ]
-        choice = st.selectbox("Candidate", labels)
-        index = int(choice.split(":", 1)[0])
-        selected = candidates.loc[index]
-
-        st.write(f"Odds: {selected['odds']}")
-        st.write(f"Estimated EV: {selected['ev']:.2%}")
-
-        if st.button("Create local draft"):
+        labels = [f"{i}: {r['event']} | {r['selection']} | {r['bookmaker']} @ {r['odds']}" for i, r in view.iterrows()]
+        choice = st.selectbox('Quote', labels)
+        index = int(choice.split(':', 1)[0])
+        selected = view.loc[index]
+        if st.button('Save analysis draft'):
             st.session_state.drafts.append({
-                "event": selected["event"],
-                "selection": selected["selection"],
-                "odds": selected["odds"],
-                "max_stake": maximum,
-                "created_at": now.isoformat()
+                'event': selected['event'], 'selection': selected['selection'],
+                'bookmaker': selected['bookmaker'], 'odds': float(selected['odds']),
+                'max_stake': maximum, 'created_at': now.isoformat()
             })
-            st.success("Draft saved in this session.")
-
+            st.success('Saved locally in this session. No bet placed.')
     if st.session_state.drafts:
-        st.dataframe(
-            pd.DataFrame(st.session_state.drafts),
-            use_container_width=True
-        )
+        st.dataframe(pd.DataFrame(st.session_state.drafts), hide_index=True, use_container_width=True)
 
 with tab4:
-    st.subheader("Data & Diagnostics")
-    st.write(f"Source: {source}")
-    st.write(f"UTC check time: {now.isoformat()}")
-    st.write(f"Valid records: {len(df)}")
-    st.download_button(
-        "Download CSV template",
-        demo.to_csv(index=False),
-        file_name="atlas_template.csv",
-        mime="text/csv"
-    )
+    st.subheader('Data & Diagnostics')
+    st.write('Source: The Odds API (live endpoint; bookmaker update times may vary)')
+    st.write(f'UTC check time: {now.isoformat()}')
+    st.write(f'Sport: {selected_sport} | Region: {regions} | Market: {markets}')
+    st.write(f'Events returned: {len(events)} | Valid quotes: {len(df)}')
+    st.write(f'API requests remaining (header): {remaining}')
+    st.download_button('Download real quotes CSV', df.to_csv(index=False), file_name='atlas_real_odds.csv', mime='text/csv')
 
 st.divider()
-st.info(
-    "ATLAS never places bets automatically. "
-    "Drafts are not real bets. "
-    "Always verify market rules and live prices."
-)
+st.info('ATLAS does not place bets. Real quotes can be delayed or change. Never treat consensus-derived EV as a validated probability model.')
